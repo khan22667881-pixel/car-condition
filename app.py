@@ -1,4 +1,4 @@
-"""Car Visible Condition Checker.
+ """Car Visible Condition Checker.
 
 A Streamlit app that looks at ONE uploaded photo of a car, together with the
 make/model/year entered by the user, and asks Google Gemini (a Flash model) to
@@ -34,7 +34,12 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 # Configuration
 # --------------------------------------------------------------------------- #
 
-DEFAULT_MODEL = "gemini-2.5-flash"
+# "gemini-flash-latest" is an alias Google keeps pointing at the newest Flash model,
+# so the app keeps working when individual model names are retired.
+DEFAULT_MODEL = "gemini-flash-latest"
+# Tried in order if the chosen model returns "not found" (HTTP 404).
+FALLBACK_MODELS = ("gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash")
+MAX_DISCOVERED_MODELS = 3
 API_KEY_NAMES = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
 
 ALLOWED_EXTENSIONS = ["jpg", "jpeg", "png", "webp"]
@@ -128,10 +133,6 @@ def get_api_key() -> str | None:
         if key:
             return key
     return None
-
-
-def get_model_name() -> str:
-    return read_setting("GEMINI_MODEL") or DEFAULT_MODEL
 
 
 @st.cache_resource(show_spinner=False)
@@ -319,12 +320,21 @@ def parse_json_object(text: str) -> dict[str, Any] | None:
     return None
 
 
-def analyse_photo(
+class ModelNotFound(Exception):
+    """Internal signal: the requested model name does not exist for this key."""
+
+    def __init__(self, model_name: str, detail: str) -> None:
+        super().__init__(model_name)
+        self.model_name = model_name
+        self.detail = detail
+
+
+def call_model(
     client: genai.Client, model_name: str, jpeg_bytes: bytes, make: str, model: str, year: int
-) -> tuple[dict[str, Any] | None, str]:
-    """Call Gemini. Returns (parsed dict or None, raw response text)."""
+) -> Any:
+    """Make one generate_content call, translating SDK errors."""
     try:
-        response = client.models.generate_content(
+        return client.models.generate_content(
             model=model_name,
             contents=[
                 types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg"),
@@ -332,13 +342,15 @@ def analyse_photo(
             ],
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_INSTRUCTION,
-                temperature=0.2,
                 max_output_tokens=8192,
                 response_mime_type="application/json",
             ),
         )
     except genai_errors.APIError as exc:
-        details = f"HTTP {getattr(exc, 'code', '?')}: {str(getattr(exc, 'message', None) or exc)[:500]}"
+        message = str(getattr(exc, "message", None) or exc)
+        if getattr(exc, "code", None) == 404:
+            raise ModelNotFound(model_name, message[:300]) from exc
+        details = f"Model {model_name} - HTTP {getattr(exc, 'code', '?')}: {message[:500]}"
         raise AnalysisError(friendly_api_message(exc), details=details) from exc
     except Exception as exc:  # Network problems, timeouts, SDK errors.
         raise AnalysisError(
@@ -346,8 +358,73 @@ def analyse_photo(
             details=f"{type(exc).__name__}: {str(exc)[:300]}",
         ) from exc
 
+
+def discover_flash_models(client: genai.Client) -> list[str]:
+    """Ask the API which Flash text models this key can use, newest first."""
+    found: set[str] = set()
+    try:
+        for m in client.models.list():
+            name = (getattr(m, "name", "") or "").removeprefix("models/")
+            low = name.lower()
+            actions = getattr(m, "supported_actions", None)
+            if actions is not None and "generateContent" not in actions:
+                continue
+            if not low.startswith("gemini-") or "flash" not in low:
+                continue
+            if any(x in low for x in ("image", "tts", "live", "audio", "embedding", "robotics", "omni", "computer")):
+                continue
+            found.add(name)
+    except Exception:
+        return []
+
+    def sort_key(name: str) -> tuple[float, bool, bool]:
+        numbers = re.findall(r"\d+(?:\.\d+)?", name)
+        version = float(numbers[0]) if numbers else 0.0
+        return (version, "lite" not in name, "preview" not in name)
+
+    return sorted(found, key=sort_key, reverse=True)
+
+
+def analyse_photo(
+    client: genai.Client, preferred_model: str, jpeg_bytes: bytes, make: str, model: str, year: int
+) -> tuple[dict[str, Any] | None, str, str]:
+    """Call Gemini, falling back to other Flash models on "model not found".
+
+    Returns (parsed dict or None, raw response text, model name that worked).
+    """
+    tried: list[str] = []
+    response = None
+    used_model = ""
+
+    def attempt(name: str) -> bool:
+        nonlocal response, used_model
+        try:
+            response = call_model(client, name, jpeg_bytes, make, model, year)
+        except ModelNotFound:
+            tried.append(name)
+            return False
+        used_model = name
+        return True
+
+    candidates = list(dict.fromkeys([preferred_model, *FALLBACK_MODELS]))
+    succeeded = any(attempt(name) for name in candidates)
+
+    if not succeeded:
+        discovered = [m for m in discover_flash_models(client) if m not in tried]
+        for name in discovered[:MAX_DISCOVERED_MODELS]:
+            if attempt(name):
+                succeeded = True
+                break
+
+    if not succeeded or response is None:
+        raise AnalysisError(
+            "No Gemini Flash model could be found for this API key. Set GEMINI_MODEL to a "
+            "model name your key can use (see the model list in Google AI Studio).",
+            details="Models tried: " + ", ".join(tried),
+        )
+
     raw_text = extract_text(response)
-    return parse_json_object(raw_text), raw_text
+    return parse_json_object(raw_text), raw_text, used_model
 
 
 # --------------------------------------------------------------------------- #
@@ -601,7 +678,9 @@ def main() -> None:
 
     try:
         with st.spinner("Analysing the photo... this usually takes a few seconds."):
-            data, raw_text = analyse_photo(client, get_model_name(), jpeg_bytes, make, model, year)
+            preferred = read_setting("GEMINI_MODEL") or st.session_state.get("working_model") or DEFAULT_MODEL
+            data, raw_text, used_model = analyse_photo(client, preferred, jpeg_bytes, make, model, year)
+            st.session_state["working_model"] = used_model
     except AnalysisError as exc:
         st.error(exc.message)
         if exc.details:
