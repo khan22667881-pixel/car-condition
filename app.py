@@ -1,4 +1,4 @@
- """Car Visible Condition Checker.
+"""Car Visible Condition Checker.
 
 A Streamlit app that looks at ONE uploaded photo of a car, together with the
 make/model/year entered by the user, and asks Google Gemini (a Flash model) to
