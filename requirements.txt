@@ -1,0 +1,9 @@
+# Web UI (use_container_width on st.image requires a recent release)
+streamlit>=1.40.0
+
+# Google Gemini SDK. Note the package name is "google-genai"
+# (NOT "google-generativeai"); it provides `from google import genai`.
+google-genai>=1.20.0
+
+# Image validation, rotation fix and resizing
+Pillow>=10.0.0
