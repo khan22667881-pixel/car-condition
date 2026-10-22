@@ -1,5 +1,4 @@
-# car-condition
-# 🚗 Car Visible Condition Checker
+ # 🚗 Car Visible Condition Checker
 
 A Streamlit app that looks at an uploaded photo of a car, together with the make, model and year you enter, and uses **Google Gemini (Flash)** to describe the car's **visible exterior condition**, observable damage or wear, and sensible next steps.
 
@@ -11,7 +10,7 @@ A Streamlit app that looks at an uploaded photo of a car, together with the make
 - Cautious rating: Excellent / Good / Fair / Poor / Cannot determine, with a confidence level that is never higher than "Medium"
 - Area-by-area observations, a list of visible damage or wear, and practical follow-up recommendations
 - Clear list of what a photo cannot tell you
-- Graceful handling of: missing API key, unreadable, corrupted, tiny or oversized images, empty or blocked model responses, malformed model output, rate limits, invalid keys and network errors
+- Graceful handling of: missing API key, unreadable, corrupted, tiny or oversized images, empty or blocked model responses, malformed model output, rate limits, invalid keys, retired model names (automatic fallback) and network errors
 - API key is never stored in source code (Streamlit secrets or an environment variable)
 
 ## Project files
@@ -100,13 +99,17 @@ __pycache__/
 
 If a key is ever pushed to GitHub by mistake, treat it as compromised: delete it in Google AI Studio, create a new one, and update your secrets.
 
-### Optional: choose a different model
+### Model selection (automatic, with optional override)
 
-The app defaults to `gemini-2.5-flash`. If Google retires or renames that model, or you want a newer Flash model, set `GEMINI_MODEL` the same way as the key (environment variable or secret), for example:
+Google retires older Gemini model names over time, so the app defaults to the alias `gemini-flash-latest`, which always points at a current Flash model. If a model name returns "not found", the app automatically tries other Flash models (`gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-2.5-flash`) and then asks the API which Flash models your key can use. It remembers the one that works for the rest of the session.
+
+To pin a specific model instead, set `GEMINI_MODEL` the same way as the key (environment variable or secret):
 
 ```toml
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.6-flash"
 ```
+
+Check Google's current model list at <https://ai.google.dev/gemini-api/docs/models> if you want to choose one yourself.
 
 ## Push the project to GitHub
 
@@ -163,7 +166,7 @@ GEMINI_MODEL = "gemini-2.5-flash"
 | "No Gemini API key was found" | The key is not set. Set the environment variable locally, or add it under **Settings -> Secrets** on Streamlit Community Cloud. |
 | "The Gemini API rejected the API key" | The key is wrong, deleted or restricted. Create a new one at Google AI Studio. |
 | Rate limit or quota message | The free tier has per-minute and per-day limits. Wait and retry, or enable billing. |
-| "The configured Gemini model was not found" | Set `GEMINI_MODEL` to a currently available Gemini Flash model. |
+| "No Gemini Flash model could be found for this API key" | The app already tried the alias, its fallbacks and the models your key can list. Set `GEMINI_MODEL` to a model shown in Google AI Studio, and confirm the key belongs to a project with the Gemini API enabled. |
 | Image rejected | Use a JPG, PNG or WebP under 10 MB and at least 200 px on the short side. HEIC photos from some phones must be converted to JPG first. |
 | "The model's answer could not be read" | Rare formatting failure from the model. Click the button again. |
 
