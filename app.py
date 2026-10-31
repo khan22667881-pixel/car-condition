@@ -21,6 +21,7 @@ import io
 import json
 import os
 import re
+import time
 from datetime import date
 from typing import Any
 
@@ -38,8 +39,18 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 # so the app keeps working when individual model names are retired.
 DEFAULT_MODEL = "gemini-flash-latest"
 # Tried in order if the chosen model returns "not found" (HTTP 404).
-FALLBACK_MODELS = ("gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash")
+FALLBACK_MODELS = (
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash",
+)
 MAX_DISCOVERED_MODELS = 3
+TRANSIENT_CODES = (429, 500, 502, 503, 504)
+RETRIES_PER_MODEL = 2  # attempts per model for temporary errors (1 retry)
+RETRY_DELAY_SECONDS = 2.0
+OVERALL_DEADLINE_SECONDS = 150  # stop retrying after this long in total
 API_KEY_NAMES = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
 
 ALLOWED_EXTENSIONS = ["jpg", "jpeg", "png", "webp"]
@@ -49,7 +60,7 @@ MIN_IMAGE_SIDE = 200  # pixels; smaller images are too small to assess
 MAX_IMAGE_SIDE = 1600  # pixels; larger images are downscaled before upload
 MAX_TEXT_LEN = 60
 MIN_YEAR = 1950
-REQUEST_TIMEOUT_MS = 90_000
+REQUEST_TIMEOUT_MS = 60_000
 
 RATINGS = ["Excellent", "Good", "Fair", "Poor", "Cannot determine"]
 RATING_LOOKUP = {r.lower(): r for r in RATINGS}
@@ -329,10 +340,20 @@ class ModelNotFound(Exception):
         self.detail = detail
 
 
+class ModelBusy(Exception):
+    """Internal signal: a temporary failure (overload, rate limit, timeout, network)."""
+
+    def __init__(self, model_name: str, code: int | None, detail: str) -> None:
+        super().__init__(model_name)
+        self.model_name = model_name
+        self.code = code
+        self.detail = detail
+
+
 def call_model(
     client: genai.Client, model_name: str, jpeg_bytes: bytes, make: str, model: str, year: int
 ) -> Any:
-    """Make one generate_content call, translating SDK errors."""
+    """Make one generate_content call, translating SDK errors into internal signals."""
     try:
         return client.models.generate_content(
             model=model_name,
@@ -347,16 +368,17 @@ def call_model(
             ),
         )
     except genai_errors.APIError as exc:
+        code = getattr(exc, "code", None)
         message = str(getattr(exc, "message", None) or exc)
-        if getattr(exc, "code", None) == 404:
+        low = message.lower()
+        if code == 404:
             raise ModelNotFound(model_name, message[:300]) from exc
-        details = f"Model {model_name} - HTTP {getattr(exc, 'code', '?')}: {message[:500]}"
+        if code in TRANSIENT_CODES or any(w in low for w in ("overloaded", "unavailable", "high demand")):
+            raise ModelBusy(model_name, code, message[:300]) from exc
+        details = f"Model {model_name} - HTTP {code}: {message[:500]}"
         raise AnalysisError(friendly_api_message(exc), details=details) from exc
-    except Exception as exc:  # Network problems, timeouts, SDK errors.
-        raise AnalysisError(
-            "Could not reach the Gemini service. Check your internet connection and try again.",
-            details=f"{type(exc).__name__}: {str(exc)[:300]}",
-        ) from exc
+    except Exception as exc:  # Timeouts, dropped connections, other SDK/network errors.
+        raise ModelBusy(model_name, None, f"{type(exc).__name__}: {str(exc)[:300]}") from exc
 
 
 def discover_flash_models(client: genai.Client) -> list[str]:
@@ -385,43 +407,76 @@ def discover_flash_models(client: genai.Client) -> list[str]:
     return sorted(found, key=sort_key, reverse=True)
 
 
+def explain_failures(failures: list[tuple[str, int | None, str]]) -> str:
+    """Turn the list of (model, http code, detail) failures into one user message."""
+    codes = {code for _, code, _ in failures}
+    if not failures or codes & {500, 502, 503, 504}:
+        return (
+            "Google's Gemini service is overloaded right now. The app retried and tried "
+            "other Flash models, but none could answer. Please wait a minute or two and "
+            "press the button again."
+        )
+    if 429 in codes:
+        return "The Gemini API rate limit or quota has been reached. Please wait a minute and try again."
+    if None in codes:
+        return "Could not reach the Gemini service. Check your internet connection and try again."
+    return (
+        "No Gemini Flash model could be found for this API key. Set GEMINI_MODEL to a "
+        "model name your key can use (see the model list in Google AI Studio)."
+    )
+
+
 def analyse_photo(
     client: genai.Client, preferred_model: str, jpeg_bytes: bytes, make: str, model: str, year: int
 ) -> tuple[dict[str, Any] | None, str, str]:
-    """Call Gemini, falling back to other Flash models on "model not found".
+    """Call Gemini with retries and model fallback.
+
+    - Temporary errors (503 overload, 500/504, timeouts) are retried once on the same
+      model, then the next model is tried.
+    - "Model not found" (404) moves straight to the next model.
+    - Other errors (bad key, invalid request, safety block) stop immediately.
 
     Returns (parsed dict or None, raw response text, model name that worked).
     """
-    tried: list[str] = []
-    response = None
+    deadline = time.monotonic() + OVERALL_DEADLINE_SECONDS
+    failures: list[tuple[str, int | None, str]] = []
+    response: Any = None
     used_model = ""
 
-    def attempt(name: str) -> bool:
+    def attempt(name: str, tries: int) -> bool:
         nonlocal response, used_model
-        try:
-            response = call_model(client, name, jpeg_bytes, make, model, year)
-        except ModelNotFound:
-            tried.append(name)
-            return False
-        used_model = name
-        return True
+        for i in range(tries):
+            if time.monotonic() >= deadline:
+                return False
+            try:
+                response = call_model(client, name, jpeg_bytes, make, model, year)
+            except ModelNotFound as exc:
+                failures.append((name, 404, exc.detail))
+                return False
+            except ModelBusy as exc:
+                failures.append((name, exc.code, exc.detail))
+                if exc.code == 429:  # Quota is per model; retrying the same one will not help.
+                    return False
+                if i < tries - 1:
+                    time.sleep(RETRY_DELAY_SECONDS)
+                continue
+            used_model = name
+            return True
+        return False
 
     candidates = list(dict.fromkeys([preferred_model, *FALLBACK_MODELS]))
-    succeeded = any(attempt(name) for name in candidates)
+    succeeded = any(attempt(name, RETRIES_PER_MODEL) for name in candidates)
 
-    if not succeeded:
-        discovered = [m for m in discover_flash_models(client) if m not in tried]
-        for name in discovered[:MAX_DISCOVERED_MODELS]:
-            if attempt(name):
+    if not succeeded and time.monotonic() < deadline:
+        tried = {name for name, _, _ in failures}
+        for name in [m for m in discover_flash_models(client) if m not in tried][:MAX_DISCOVERED_MODELS]:
+            if attempt(name, 1):
                 succeeded = True
                 break
 
     if not succeeded or response is None:
-        raise AnalysisError(
-            "No Gemini Flash model could be found for this API key. Set GEMINI_MODEL to a "
-            "model name your key can use (see the model list in Google AI Studio).",
-            details="Models tried: " + ", ".join(tried),
-        )
+        summary = "; ".join(f"{n} -> {c if c is not None else 'network'}" for n, c, _ in failures[-8:])
+        raise AnalysisError(explain_failures(failures), details=f"Attempts: {summary}" if summary else None)
 
     raw_text = extract_text(response)
     return parse_json_object(raw_text), raw_text, used_model
@@ -677,7 +732,7 @@ def main() -> None:
         return
 
     try:
-        with st.spinner("Analysing the photo... this usually takes a few seconds."):
+        with st.spinner("Analysing the photo... if Gemini is busy, the app retries automatically (up to about 2 minutes)."):
             preferred = read_setting("GEMINI_MODEL") or st.session_state.get("working_model") or DEFAULT_MODEL
             data, raw_text, used_model = analyse_photo(client, preferred, jpeg_bytes, make, model, year)
             st.session_state["working_model"] = used_model
